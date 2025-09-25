@@ -1,0 +1,29 @@
+name: CT-MRI Backlog Alert (Vision)
+on:
+  schedule:
+    - cron: "0 * * * *"   # run hourly; script self-gates to your ET windows
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          pip install playwright==1.47.0 pytz requests
+          python -m playwright install --with-deps chromium
+      - name: Check backlog (GPT Vision)
+        env:
+          AVR_USER: ${{ secrets.AVR_USER }}
+          AVR_PASS: ${{ secrets.AVR_PASS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          THRESHOLD: "25"
+          AGE_MINUTES: "60"
+          SITE_LABEL: "Baptist Health Corbin (AVR)"
+          OPENAI_VISION_MODEL: "gpt-4o-mini"
+        run: python check_backlog_gpt.py
