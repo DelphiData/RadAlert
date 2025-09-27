@@ -1,8 +1,10 @@
 name: CT-MRI Backlog Alert (Vision)
 on:
   schedule:
-    - cron: "0 * * * *"   # run hourly; script self-gates to your ET windows
+    # Run hourly; the script enforces your ET windows (6/8/10p M–F; Sat 4a→10p q2h)
+    - cron: "0 * * * *"
   workflow_dispatch: {}
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -13,7 +15,7 @@ jobs:
           python-version: "3.11"
       - name: Install deps
         run: |
-          pip install playwright==1.47.0 pytz requests
+          pip install -r requirements.txt
           python -m playwright install --with-deps chromium
       - name: Check backlog (GPT Vision)
         env:
@@ -22,8 +24,11 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # ---- Configurable knobs ----
           THRESHOLD: "25"
           AGE_MINUTES: "60"
           SITE_LABEL: "Baptist Health Corbin (AVR)"
           OPENAI_VISION_MODEL: "gpt-4o-mini"
+          # Set DRY_RUN=true in repo secrets to validate for a day
+          DRY_RUN: ${{ secrets.DRY_RUN }}
         run: python check_backlog_gpt.py
