@@ -1,0 +1,49 @@
+name: RadAlert Sanity Check
+on:
+  workflow_dispatch: {}   # run manually
+
+jobs:
+  sanity:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check required secrets exist
+        env:
+          AVR_USER: ${{ secrets.AVR_USER }}
+          AVR_PASS: ${{ secrets.AVR_PASS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          missing=()
+          for v in AVR_USER AVR_PASS OPENAI_API_KEY TG_BOT_TOKEN TG_CHAT_ID; do
+            if [ -z "${!v}" ]; then missing+=("$v"); fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "❌ Missing secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "✅ All required secrets present."
+
+      - name: Telegram test message
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${TG_CHAT_ID}\", \"text\": \"✅ RadAlert sanity: Telegram works.\"}" \
+            | grep -q '"ok":true' && echo "✅ Telegram OK" || (echo "❌ Telegram failed"; exit 1)
+
+      - name: OpenAI key smoke test
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          curl -sS https://api.openai.com/v1/models -H "Authorization: Bearer $OPENAI_API_KEY" \
+            | head -c 200 >/dev/null && echo "✅ OpenAI key OK" || (echo "❌ OpenAI key failed"; exit 1)
+
+      - name: Playwright install smoke test
+        run: |
+          python -V
+          pip install playwright==1.47.0 >/dev/null
+          python -m playwright install --with-deps chromium
+          echo "✅ Playwright installed"
