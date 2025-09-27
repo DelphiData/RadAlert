@@ -4,7 +4,7 @@ import pytz
 import requests
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-print("=== RadAlert LOGIN HANDLER v3 ===")
+print("=== RadAlert LOGIN HANDLER v4 (label-based) ===")
 
 # ----------------------------
 # Config (from environment)
@@ -28,10 +28,6 @@ SITE_LABEL = os.environ.get("SITE_LABEL", "Baptist Health Corbin (AVR)")
 # DRY RUN: when true we always post the model's JSON (no threshold gating),
 # and we also send helper screenshots for troubleshooting.
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-
-# Optional override if you know a precise selector:
-LOGIN_CLICK_SELECTOR = os.environ.get("LOGIN_CLICK_SELECTOR", "").strip()  # e.g., text=/RESULTS REPORTING SYSTEM/i
-
 
 # ----------------------------
 # Helpers
@@ -100,7 +96,7 @@ Return JSON ONLY with this exact schema (no extra keys, no commentary):
     "CT": <int>,
     "MRI": <int>
   }},
-  "sample_ids_or_rows": [<up to 5 short identifiers or row snippets you actually used>]
+    "sample_ids_or_rows": [<up to 5 short identifiers or row snippets you actually used>]
 }}
 """
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -130,98 +126,84 @@ Return JSON ONLY with this exact schema (no extra keys, no commentary):
 # ----------------------------
 # Login helpers
 # ----------------------------
-async def click_prelogin_triggers(target, label: str) -> bool:
-    """Try several selectors to reveal the login form on a page or frame."""
-    candidates = []
-    if LOGIN_CLICK_SELECTOR:
-        candidates.append(LOGIN_CLICK_SELECTOR)
-
-    # Good guesses for what you showed in the screenshot:
-    candidates += [
+async def reveal_login(page):
+    """Click the left tile to reveal the login panel."""
+    # Try several options; the screenshot shows those two blocks.
+    candidates = [
         'text=/RESULTS REPORTING SYSTEM/i',
-        'a:has-text("RESULTS REPORTING SYSTEM")',
         'text=/Preliminary Reports/i',
+        'a:has-text("RESULTS REPORTING SYSTEM")',
         'a:has-text("Preliminary Reports")',
-        # Click the left card generically: the first <a> in the hero area
-        'xpath=(//a)[1]'
+        'xpath=(//a)[1]'  # generic fallback: first anchor
     ]
-
     for sel in candidates:
         try:
-            await target.click(sel, timeout=1500)
-            # give it a moment to render form
-            await target.wait_for_timeout(500)
-            return True
+            await page.click(sel, timeout=1500)
+            await page.wait_for_timeout(500)
+            # if a username label appears, we’re good
+            if await page.locator('text=/^Username/i').first.is_visible():
+                return
         except Exception:
             continue
-    return False
 
-async def try_fill_on_frame(frame, user, pw) -> bool:
-    """Try many selectors for user/pass/submit on a given frame. Return True if submitted."""
-    user_selectors = [
-        'input[name="username"]', 'input[name="user"]', 'input[id*="user" i]',
-        'input[placeholder*="User" i]', 'input[aria-label*="User" i]',
-        'input[type="email"]', 'input[type="text"]'
-    ]
-    pass_selectors = [
-        'input[name="password"]', 'input[id*="pass" i]',
-        'input[placeholder*="Pass" i]', 'input[aria-label*="Pass" i]',
-        'input[type="password"]'
-    ]
-    submit_selectors = [
-        'button[type="submit"]', 'input[type="submit"]',
-        'button:has-text("Login")', 'button:has-text("Sign In")',
-        'input[value*="Login" i]', 'input[value*="Sign In" i]'
-    ]
-
-    user_ok = False
-    for sel in user_selectors:
+async def fill_login_on(target, user, pw) -> bool:
+    """Fill by label first; then fallbacks near labels; then generic."""
+    # 1) Preferred: by label (works if <label for="...">Username</label> exists)
+    try:
+        await target.get_by_label(re.compile("Username", re.I)).fill(user, timeout=1500)
+        await target.get_by_label(re.compile("Password", re.I)).fill(pw, timeout=1500)
+        # click Enter
         try:
-            await frame.fill(sel, user, timeout=1200)
-            user_ok = True
-            break
+            await target.get_by_role("button", name=re.compile("Enter", re.I)).click(timeout=1000)
         except Exception:
-            continue
+            await target.locator('text=/^Enter$/i').click(timeout=1000)
+        return True
+    except Exception:
+        pass
 
-    pass_ok = False
-    for sel in pass_selectors:
+    # 2) Fallback: the input immediately after the label text
+    try:
+        u = target.locator('//label[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"username")]/following::input[1]')
+        p = target.locator('//label[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"password")]/following::input[1]')
+        await u.fill(user, timeout=1500)
+        await p.fill(pw, timeout=1500)
         try:
-            await frame.fill(sel, pw, timeout=1200)
-            pass_ok = True
-            break
+            await target.locator('text=/^Enter$/i').click(timeout=1000)
         except Exception:
-            continue
+            await target.locator('//input[@type="submit" or @value][contains(translate(@value,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"enter")]').first.click(timeout=1000)
+        return True
+    except Exception:
+        pass
 
-    if user_ok and pass_ok:
-        for sel in submit_selectors:
-            try:
-                await frame.click(sel, timeout=1200)
-                return True
-            except Exception:
-                continue
-    return False
+    # 3) Last resort: common generic selectors
+    try:
+        await target.fill('input[type="text"]', user, timeout=1200)
+        await target.fill('input[type="password"]', pw, timeout=1200)
+        try:
+            await target.locator('text=/^Enter$/i').click(timeout=1000)
+        except Exception:
+            await target.locator('input[type="submit"]').first.click(timeout=1000)
+        return True
+    except Exception:
+        return False
 
 async def perform_login(page, user, pw) -> bool:
-    """Reveal the login form (page + iframes), then fill and submit."""
-    # 0) Try clicking triggers on main page
-    await click_prelogin_triggers(page, "page")
+    await reveal_login(page)
 
-    # 1) Try to fill on main page
-    if await try_fill_on_frame(page, user, pw):
+    # Try main page
+    if await fill_login_on(page, user, pw):
         return True
 
-    # 2) Try clicking/filling on each iframe
+    # Try in any iframe just in case
     for f in page.frames:
         if f is page.main_frame:
             continue
-        await click_prelogin_triggers(f, "frame")
-        if await try_fill_on_frame(f, user, pw):
-            return True
-
-    # 3) Last resort: click again on page and retry fill
-    await click_prelogin_triggers(page, "page-retry")
-    if await try_fill_on_frame(page, user, pw):
-        return True
+        try:
+            await reveal_login(f)
+            if await fill_login_on(f, user, pw):
+                return True
+        except Exception:
+            continue
 
     return False
 
@@ -237,10 +219,8 @@ async def run_once():
         ctx = await browser.new_context()
         page = await ctx.new_page()
 
-        # Go to landing
+        # Go to landing and reveal the login form
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-        # Perform login
         logged_in = await perform_login(page, AVR_USER, AVR_PASS)
 
         if not logged_in:
@@ -255,7 +235,7 @@ async def run_once():
         except PWTimeout:
             pass
 
-        # Extract HTML for the worklist table (best-effort; fall back to page HTML)
+        # Try to get the worklist table HTML; otherwise fallback to page HTML
         table_html = ""
         try:
             worklist_heading = page.locator("text=Worklist").first
@@ -268,7 +248,7 @@ async def run_once():
             except Exception:
                 table_html = await page.content()
 
-        # Screenshot for the model (full page is simplest & robust)
+        # Screenshot for model
         png_bytes = await page.screenshot(full_page=True)
 
         if DRY_RUN:
