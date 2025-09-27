@@ -2,9 +2,9 @@ import os, re, asyncio, json, base64
 from datetime import datetime
 import pytz
 import requests
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-print("=== RadAlert NEW LOGIN HANDLER v2 is running ===")
+print("=== RadAlert LOGIN HANDLER v3 ===")
 
 # ----------------------------
 # Config (from environment)
@@ -29,38 +29,29 @@ SITE_LABEL = os.environ.get("SITE_LABEL", "Baptist Health Corbin (AVR)")
 # and we also send helper screenshots for troubleshooting.
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-# Optional: if the page requires a click to reveal the login form, set a selector here (env)
-# e.g., LOGIN_CLICK_SELECTOR='text=/^(Login|Sign In)$/i' or a specific button selector
-LOGIN_CLICK_SELECTOR = os.environ.get("LOGIN_CLICK_SELECTOR", "text=/^(Login|Sign In)$/i")
+# Optional override if you know a precise selector:
+LOGIN_CLICK_SELECTOR = os.environ.get("LOGIN_CLICK_SELECTOR", "").strip()  # e.g., text=/RESULTS REPORTING SYSTEM/i
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
 def within_window_now():
-    """
-    Enforce schedule:
-      - Mon–Fri at 6p, 8p, 10p ET
-      - Sat 4a–10p ET every 2 hours
-    Run the workflow hourly and let this gate actual execution.
-    """
+    """Mon–Fri at 6p, 8p, 10p ET; Sat 4a–10p ET q2h. DRY_RUN bypasses."""
     now = datetime.now(TZ)
-    wd, hr = now.weekday(), now.hour  # Mon=0..Sun=6
+    wd, hr = now.weekday(), now.hour
     if wd in range(0, 5) and hr in (18, 20, 22):
         return True
     if wd == 5 and hr in (4, 6, 8, 10, 12, 14, 16, 18, 20, 22):
         return True
     return False
 
-
 def to_data_url(png_bytes: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(png_bytes).decode()
 
-
 def send_telegram_text(text: str):
-    """Sends a Telegram message; splits if longer than Telegram limits."""
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    CHUNK = 3500  # leave room for HTML tags
+    CHUNK = 3500
     if len(text) <= CHUNK:
         requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=30)
     else:
@@ -69,7 +60,6 @@ def send_telegram_text(text: str):
             chunk = text[i:i+CHUNK]
             requests.post(url, json={"chat_id": TG_CHAT_ID, "text": chunk, "parse_mode": "HTML"}, timeout=30)
             i += CHUNK
-
 
 def send_telegram_photo(png_bytes: bytes, caption: str = ""):
     try:
@@ -82,17 +72,11 @@ def send_telegram_photo(png_bytes: bytes, caption: str = ""):
     except Exception as e:
         send_telegram_text(f"Could not send screenshot: {e}")
 
-
 def ask_gpt_vision(image_data_url: str, table_html: str, now_iso_et: str) -> dict:
-    """
-    Sends image + HTML to a vision model and expects STRICT JSON back.
-    Counts procedures (CT/MRI) older than AGE_MINUTES; supports multiple procedures in one row.
-    """
     system = (
         "You are a meticulous auditor. You extract counts from a radiology worklist screenshot and corresponding HTML. "
         "Output STRICT JSON only, no prose."
     )
-
     user_prompt = f"""
 You are given a screenshot and the corresponding HTML of the 'Worklist' table from a radiology prelim system.
 
@@ -119,7 +103,6 @@ Return JSON ONLY with this exact schema (no extra keys, no commentary):
   "sample_ids_or_rows": [<up to 5 short identifiers or row snippets you actually used>]
 }}
 """
-
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": MODEL,
@@ -136,8 +119,6 @@ Return JSON ONLY with this exact schema (no extra keys, no commentary):
     resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=120)
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"].strip()
-
-    # force JSON parse
     try:
         return json.loads(content)
     except json.JSONDecodeError:
@@ -146,10 +127,35 @@ Return JSON ONLY with this exact schema (no extra keys, no commentary):
             raise
         return json.loads(m.group(0))
 
+# ----------------------------
+# Login helpers
+# ----------------------------
+async def click_prelogin_triggers(target, label: str) -> bool:
+    """Try several selectors to reveal the login form on a page or frame."""
+    candidates = []
+    if LOGIN_CLICK_SELECTOR:
+        candidates.append(LOGIN_CLICK_SELECTOR)
 
-# ----------------------------
-# Login strategy
-# ----------------------------
+    # Good guesses for what you showed in the screenshot:
+    candidates += [
+        'text=/RESULTS REPORTING SYSTEM/i',
+        'a:has-text("RESULTS REPORTING SYSTEM")',
+        'text=/Preliminary Reports/i',
+        'a:has-text("Preliminary Reports")',
+        # Click the left card generically: the first <a> in the hero area
+        'xpath=(//a)[1]'
+    ]
+
+    for sel in candidates:
+        try:
+            await target.click(sel, timeout=1500)
+            # give it a moment to render form
+            await target.wait_for_timeout(500)
+            return True
+        except Exception:
+            continue
+    return False
+
 async def try_fill_on_frame(frame, user, pw) -> bool:
     """Try many selectors for user/pass/submit on a given frame. Return True if submitted."""
     user_selectors = [
@@ -171,62 +177,58 @@ async def try_fill_on_frame(frame, user, pw) -> bool:
     user_ok = False
     for sel in user_selectors:
         try:
-            await frame.fill(sel, user, timeout=1500)
+            await frame.fill(sel, user, timeout=1200)
             user_ok = True
             break
-        except:
+        except Exception:
             continue
 
     pass_ok = False
     for sel in pass_selectors:
         try:
-            await frame.fill(sel, pw, timeout=1500)
+            await frame.fill(sel, pw, timeout=1200)
             pass_ok = True
             break
-        except:
+        except Exception:
             continue
 
     if user_ok and pass_ok:
         for sel in submit_selectors:
             try:
-                await frame.click(sel, timeout=1500)
+                await frame.click(sel, timeout=1200)
                 return True
-            except:
+            except Exception:
                 continue
     return False
 
-
 async def perform_login(page, user, pw) -> bool:
-    """Try to reveal and fill the login form on the main page or any iframe."""
-    # If the login form is hidden behind a link/button, click it.
-    if LOGIN_CLICK_SELECTOR:
-        try:
-            await page.click(LOGIN_CLICK_SELECTOR, timeout=3000)
-        except:
-            pass
+    """Reveal the login form (page + iframes), then fill and submit."""
+    # 0) Try clicking triggers on main page
+    await click_prelogin_triggers(page, "page")
 
-    # 1) Try on main page
+    # 1) Try to fill on main page
     if await try_fill_on_frame(page, user, pw):
         return True
 
-    # 2) Try all iframes
+    # 2) Try clicking/filling on each iframe
     for f in page.frames:
         if f is page.main_frame:
             continue
-        try:
-            if await try_fill_on_frame(f, user, pw):
-                return True
-        except:
-            continue
+        await click_prelogin_triggers(f, "frame")
+        if await try_fill_on_frame(f, user, pw):
+            return True
+
+    # 3) Last resort: click again on page and retry fill
+    await click_prelogin_triggers(page, "page-retry")
+    if await try_fill_on_frame(page, user, pw):
+        return True
 
     return False
-
 
 # ----------------------------
 # Main one-shot run
 # ----------------------------
 async def run_once():
-    # Gate by time windows unless DRY_RUN is explicitly used to test outside windows as well
     if not DRY_RUN and not within_window_now():
         return
 
@@ -235,28 +237,23 @@ async def run_once():
         ctx = await browser.new_context()
         page = await ctx.new_page()
 
-        # ---- Navigate to login ----
+        # Go to landing
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
-        # ---- Login attempts ----
+        # Perform login
         logged_in = await perform_login(page, AVR_USER, AVR_PASS)
 
-        # If still not, send a screenshot (DRY_RUN) and stop
         if not logged_in:
             png_login = await page.screenshot(full_page=True)
             if DRY_RUN:
                 send_telegram_photo(png_login, "RadAlert: could not find login fields. Screenshot.")
-            raise RuntimeError("Login fields not found. Check Telegram screenshot (DRY_RUN) to adjust selectors.")
+            raise RuntimeError("Login fields not found. Check Telegram screenshot (DRY_RUN).")
 
         # Wait for post-login network to settle
-        await page.wait_for_load_state("networkidle")
-
-        # ---- Navigate/show Worklist if needed (uncomment if your UI requires it) ----
-        # try:
-        #     await page.click('a:has-text("Worklist")', timeout=3000)
-        #     await page.wait_for_load_state("networkidle")
-        # except:
-        #     pass
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except PWTimeout:
+            pass
 
         # Extract HTML for the worklist table (best-effort; fall back to page HTML)
         table_html = ""
@@ -274,7 +271,6 @@ async def run_once():
         # Screenshot for the model (full page is simplest & robust)
         png_bytes = await page.screenshot(full_page=True)
 
-        # In DRY_RUN, also send the page screenshot so you can verify we’re on the right screen
         if DRY_RUN:
             send_telegram_photo(png_bytes, "RadAlert DRY_RUN: page screenshot after login.")
 
@@ -287,14 +283,13 @@ async def run_once():
     # Ask GPT Vision
     result = ask_gpt_vision(data_url, table_html, now_et_iso)
 
-    # DRY-RUN: always post the JSON to Telegram (for validation)
     if DRY_RUN:
         pretty = json.dumps(result, indent=2)
         msg = f"🔍 <b>Dry-run JSON dump</b>\n<pre>{pretty}</pre>"
         send_telegram_text(msg)
         return
 
-    # LIVE MODE: only alert when threshold is crossed
+    # LIVE MODE
     ct_mri = int(result.get("count_ct_mri_over_60", 0))
     by_mod = result.get("by_modality", {})
     ct = by_mod.get("CT", 0)
@@ -308,7 +303,6 @@ async def run_once():
             f"{LOGIN_URL}"
         )
         send_telegram_text(msg)
-
 
 # ----------------------------
 # Entrypoint
