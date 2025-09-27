@@ -4,7 +4,7 @@ import pytz
 import requests
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-print("=== RadAlert LOGIN HANDLER v4 (label-based) ===")
+print("=== RadAlert LOGIN HANDLER v5 (visible-inputs) ===")
 
 # ----------------------------
 # Config (from environment)
@@ -16,24 +16,21 @@ AVR_USER = os.environ["AVR_USER"]
 AVR_PASS = os.environ["AVR_PASS"]
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")  # vision-capable chat model
+MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")
 
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-TG_CHAT_ID = os.environ["TG_CHAT_ID"]  # channel handle like @my_channel or numeric id
+TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 
 THRESHOLD = int(os.environ.get("THRESHOLD", "25"))
 AGE_MINUTES = int(os.environ.get("AGE_MINUTES", "60"))
 SITE_LABEL = os.environ.get("SITE_LABEL", "Baptist Health Corbin (AVR)")
 
-# DRY RUN: when true we always post the model's JSON (no threshold gating),
-# and we also send helper screenshots for troubleshooting.
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 # ----------------------------
 # Helpers
 # ----------------------------
 def within_window_now():
-    """Mon–Fri at 6p, 8p, 10p ET; Sat 4a–10p ET q2h. DRY_RUN bypasses."""
     now = datetime.now(TZ)
     wd, hr = now.weekday(), now.hour
     if wd in range(0, 5) and hr in (18, 20, 22):
@@ -84,19 +81,16 @@ Counting rules (IMPORTANT):
   count EACH CT/MRI occurrence separately.
 - A procedure qualifies if the row's Date + Time (request time) is more than {AGE_MINUTES} minutes before NOW_ET.
 - Ignore all non-CT, non-MRI studies (e.g., XRAY, US, etc.).
-- If anything is ambiguous, be conservative and do not invent data.
+- If anything is ambiguous, be conservative.
 - Assume timestamps are ET unless otherwise labeled.
 
 NOW_ET (ISO8601): {now_iso_et}
 
-Return JSON ONLY with this exact schema (no extra keys, no commentary):
+Return JSON ONLY with this schema:
 {{
   "count_ct_mri_over_60": <int>,
-  "by_modality": {{
-    "CT": <int>,
-    "MRI": <int>
-  }},
-    "sample_ids_or_rows": [<up to 5 short identifiers or row snippets you actually used>]
+  "by_modality": {{"CT": <int>, "MRI": <int>}},
+  "sample_ids_or_rows": [<up to 5 short identifiers or row snippets you used>]
 }}
 """
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -126,84 +120,77 @@ Return JSON ONLY with this exact schema (no extra keys, no commentary):
 # ----------------------------
 # Login helpers
 # ----------------------------
-async def reveal_login(page):
-    """Click the left tile to reveal the login panel."""
-    # Try several options; the screenshot shows those two blocks.
-    candidates = [
+async def click_prelogin_tiles(page):
+    # Try the obvious tiles/links to reveal the login form
+    selectors = [
         'text=/RESULTS REPORTING SYSTEM/i',
         'text=/Preliminary Reports/i',
         'a:has-text("RESULTS REPORTING SYSTEM")',
         'a:has-text("Preliminary Reports")',
-        'xpath=(//a)[1]'  # generic fallback: first anchor
+        'xpath=(//a)[1]'
     ]
-    for sel in candidates:
+    for sel in selectors:
         try:
             await page.click(sel, timeout=1500)
             await page.wait_for_timeout(500)
-            # if a username label appears, we’re good
-            if await page.locator('text=/^Username/i').first.is_visible():
-                return
+            # If we now see a password box, we’re good
+            if await page.locator('input[type="password"]:visible').first.count() > 0:
+                return True
         except Exception:
             continue
+    return False
 
-async def fill_login_on(target, user, pw) -> bool:
-    """Fill by label first; then fallbacks near labels; then generic."""
-    # 1) Preferred: by label (works if <label for="...">Username</label> exists)
+async def fill_visible_inputs(target, user, pw) -> bool:
+    """Fill first VISIBLE text input and first VISIBLE password input on this target."""
     try:
-        await target.get_by_label(re.compile("Username", re.I)).fill(user, timeout=1500)
-        await target.get_by_label(re.compile("Password", re.I)).fill(pw, timeout=1500)
-        # click Enter
-        try:
-            await target.get_by_role("button", name=re.compile("Enter", re.I)).click(timeout=1000)
-        except Exception:
-            await target.locator('text=/^Enter$/i').click(timeout=1000)
-        return True
-    except Exception:
-        pass
+        # Sometimes there are hidden inputs; filter by :visible
+        user_box = target.locator('input[type="text"]:visible').first
+        pass_box = target.locator('input[type="password"]:visible').first
 
-    # 2) Fallback: the input immediately after the label text
-    try:
-        u = target.locator('//label[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"username")]/following::input[1]')
-        p = target.locator('//label[contains(translate(.,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"password")]/following::input[1]')
-        await u.fill(user, timeout=1500)
-        await p.fill(pw, timeout=1500)
-        try:
-            await target.locator('text=/^Enter$/i').click(timeout=1000)
-        except Exception:
-            await target.locator('//input[@type="submit" or @value][contains(translate(@value,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"enter")]').first.click(timeout=1000)
-        return True
-    except Exception:
-        pass
+        # Ensure they exist and are visible
+        await user_box.wait_for(state="visible", timeout=1500)
+        await pass_box.wait_for(state="visible", timeout=1500)
 
-    # 3) Last resort: common generic selectors
-    try:
-        await target.fill('input[type="text"]', user, timeout=1200)
-        await target.fill('input[type="password"]', pw, timeout=1200)
-        try:
-            await target.locator('text=/^Enter$/i').click(timeout=1000)
-        except Exception:
-            await target.locator('input[type="submit"]').first.click(timeout=1000)
+        await user_box.fill(user, timeout=1500)
+        await pass_box.fill(pw, timeout=1500)
+
+        # Click an Enter/submit control if present; else press Enter
+        clicked = False
+        for sel in [
+            'button:has-text("Enter")',
+            'input[type="submit"]:visible',
+            'input[value*="Enter" i]:visible',
+            'button[type="submit"]:visible'
+        ]:
+            try:
+                await target.click(sel, timeout=800)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                await pass_box.press("Enter")
+            except Exception:
+                pass
         return True
     except Exception:
         return False
 
 async def perform_login(page, user, pw) -> bool:
-    await reveal_login(page)
+    await click_prelogin_tiles(page)
 
-    # Try main page
-    if await fill_login_on(page, user, pw):
+    # Try on main page
+    if await fill_visible_inputs(page, user, pw):
         return True
 
-    # Try in any iframe just in case
+    # Try in iframes (just in case)
     for f in page.frames:
         if f is page.main_frame:
             continue
-        try:
-            await reveal_login(f)
-            if await fill_login_on(f, user, pw):
-                return True
-        except Exception:
-            continue
+        await click_prelogin_tiles(f)
+        if await fill_visible_inputs(f, user, pw):
+            return True
 
     return False
 
@@ -219,8 +206,8 @@ async def run_once():
         ctx = await browser.new_context()
         page = await ctx.new_page()
 
-        # Go to landing and reveal the login form
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+
         logged_in = await perform_login(page, AVR_USER, AVR_PASS)
 
         if not logged_in:
@@ -229,13 +216,13 @@ async def run_once():
                 send_telegram_photo(png_login, "RadAlert: could not find login fields. Screenshot.")
             raise RuntimeError("Login fields not found. Check Telegram screenshot (DRY_RUN).")
 
-        # Wait for post-login network to settle
+        # Post-login settle
         try:
             await page.wait_for_load_state("networkidle", timeout=10000)
         except PWTimeout:
             pass
 
-        # Try to get the worklist table HTML; otherwise fallback to page HTML
+        # Grab table HTML if possible
         table_html = ""
         try:
             worklist_heading = page.locator("text=Worklist").first
@@ -248,9 +235,7 @@ async def run_once():
             except Exception:
                 table_html = await page.content()
 
-        # Screenshot for model
         png_bytes = await page.screenshot(full_page=True)
-
         if DRY_RUN:
             send_telegram_photo(png_bytes, "RadAlert DRY_RUN: page screenshot after login.")
 
@@ -260,28 +245,22 @@ async def run_once():
     now_et_iso = datetime.now(TZ).isoformat()
     data_url = to_data_url(png_bytes)
 
-    # Ask GPT Vision
     result = ask_gpt_vision(data_url, table_html, now_et_iso)
 
     if DRY_RUN:
         pretty = json.dumps(result, indent=2)
-        msg = f"🔍 <b>Dry-run JSON dump</b>\n<pre>{pretty}</pre>"
-        send_telegram_text(msg)
+        send_telegram_text(f"🔍 <b>Dry-run JSON dump</b>\n<pre>{pretty}</pre>")
         return
 
-    # LIVE MODE
     ct_mri = int(result.get("count_ct_mri_over_60", 0))
     by_mod = result.get("by_modality", {})
-    ct = by_mod.get("CT", 0)
-    mri = by_mod.get("MRI", 0)
+    ct = by_mod.get("CT", 0); mri = by_mod.get("MRI", 0)
 
     if ct_mri > THRESHOLD:
         stamp = datetime.now(TZ).strftime("%-I:%M %p %Z")
-        msg = (
-            f"🟡 <b>Backlog alert</b> — {SITE_LABEL}\n"
-            f"CT/MRI > {AGE_MINUTES} min old: <b>{ct_mri}</b> (CT: {ct}, MRI: {mri}) at {stamp}\n"
-            f"{LOGIN_URL}"
-        )
+        msg = (f"🟡 <b>Backlog alert</b> — {SITE_LABEL}\n"
+               f"CT/MRI > {AGE_MINUTES} min old: <b>{ct_mri}</b> (CT: {ct}, MRI: {mri}) at {stamp}\n"
+               f"{LOGIN_URL}")
         send_telegram_text(msg)
 
 # ----------------------------
