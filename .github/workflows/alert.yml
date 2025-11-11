@@ -25,7 +25,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           # ---- Configurable knobs ----
-          THRESHOLD: "25"
+          THRESHOLD: "20"
           AGE_MINUTES: "60"
           SITE_LABEL: "Baptist Health Corbin (AVR)"
           OPENAI_VISION_MODEL: "gpt-4o-mini"
